@@ -1,10 +1,18 @@
 import os
-from flask import Flask, request, jsonify, render_template
+import numpy as np
+from flask import Flask, request, jsonify, render_template, g  # Added 'g' for request context
 import joblib
 import logging
-import numpy as np
+import time  # Added for timing requests
 
-# Define the directory where app.py (and now naive_bayes_model.pkl) resides
+# Prometheus client imports
+from prometheus_client import generate_latest, Counter, Histogram, make_wsgi_app
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+
+# Configure logging for the Flask application
+logging.basicConfig(level=logging.INFO)
+
+# Define the directory where app.py (and naive_bayes_model.pkl) resides
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Define the project's root directory (one level up from APP_DIR, where 'templates' is)
@@ -12,8 +20,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(APP_DIR, '..'))
 
 # Initialize Flask app, explicitly setting the template folder using the PROJECT_ROOT
 app = Flask(__name__, template_folder=os.path.join(PROJECT_ROOT, 'templates'))
-
-logging.basicConfig(level=logging.INFO)
 
 # Define the model path relative to the APP_DIR (where app.py and model.pkl are)
 MODEL_PATH = os.path.join(APP_DIR, 'naive_bayes_model.pkl')
@@ -27,27 +33,56 @@ except FileNotFoundError:
 except Exception as e:
     app.logger.error(f"Error loading model: {e}")
 
-try:
-    model = joblib.load(MODEL_PATH)
-    app.logger.info("Model loaded successfully!")
-except FileNotFoundError:
-    app.logger.error(f"Error: Model file '{MODEL_PATH}' not found. Please ensure it's in the same directory.")
-except Exception as e:
-    app.logger.error(f"Error loading model: {e}")
+# --- Prometheus Metrics Definitions ---
+REQUESTS_TOTAL = Counter(
+    'http_requests_total', 'Total number of HTTP requests', ['method', 'endpoint']
+)
+REQUEST_DURATION_SECONDS = Histogram(
+    'http_request_duration_seconds', 'HTTP request duration in seconds', ['method', 'endpoint']
+)
 
 
+# --- Flask Hooks for Metric Collection ---
+@app.before_request
+def before_request():
+    """Records the start time of each request."""
+    g.start_time = time.time()
+
+
+@app.after_request
+def after_request(response):
+    """
+    Records request metrics (total count and duration).
+    Excludes the /metrics endpoint itself from being tracked.
+    """
+    if request.path != '/metrics':
+        # Increment total requests counter
+        REQUESTS_TOTAL.labels(request.method, request.path).inc()
+        # Observe request duration
+        response_time = time.time() - g.start_time
+        REQUEST_DURATION_SECONDS.labels(request.method, request.path).observe(response_time)
+    return response
+
+
+# --- Flask Routes ---
 @app.route('/')
 def home():
+    """Renders the home page with a welcome message."""
     return "Welcome to the Credit Risk Category Prediction API! Navigate to /app for the web interface."
 
 
 @app.route('/app')
 def web_app():
+    """Renders the HTML web application form."""
     return render_template('index.html')
 
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    """
+    Handles prediction requests. Expects JSON input with 43 features.
+    Returns prediction and probabilities.
+    """
     if model is None:
         app.logger.error("Prediction requested but model is not loaded.")
         return jsonify({'error': 'Internal server error: Model not loaded.'}), 500
@@ -56,8 +91,7 @@ def predict():
         data = request.get_json(force=True)
         app.logger.info(f"Received raw input data: {data}")
 
-        # The order of features in the input data MUST match the order expected by the model.
-        # This order comes directly from your X.columns.tolist() output.
+        # Define the exact order of features expected by the model
         feature_order = [
             'CreditScore', 'FirstPaymentDate', 'FirstTimeHomebuyer', 'MaturityDate', 'MSA', 'MIP',
             'Units', 'Occupancy', 'OCLTV', 'DTI', 'OrigUPB', 'LTV', 'OrigInterestRate', 'Channel',
@@ -77,6 +111,7 @@ def predict():
         prediction = model.predict(features_array)
         prediction_proba = model.predict_proba(features_array)
 
+        # Assuming output classes are 0 (Low Risk) and 1 (High Risk)
         output = {
             'prediction': int(prediction[0]),
             'probability_class_0': float(prediction_proba[0][0]),
@@ -98,5 +133,15 @@ def predict():
         return jsonify({'error': f'An unexpected error occurred: {e}'}), 500
 
 
+# --- Prometheus WSGI Middleware ---
+# This wraps the Flask app to expose the /metrics endpoint
+
+app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
+    '/metrics': make_wsgi_app()
+})
+
+# --- Main entry point for running the Flask app ---
 if __name__ == '__main__':
+    # When running locally, Flask's built-in server is used.
+    # In production (e.g., with Gunicorn via Docker), this block is not executed.
     app.run(debug=True, host='0.0.0.0', port=5000)

@@ -1,0 +1,9 @@
+Flask
+pandas
+numpy
+scikit-learn
+joblib
+imbalanced-learn
+gunicorn
+pytest
+prometheus_client
